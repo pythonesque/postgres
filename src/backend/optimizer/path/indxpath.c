@@ -32,6 +32,7 @@
 #include "optimizer/predtest.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/var.h"
+#include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/bytea.h"
 #include "utils/lsyscache.h"
@@ -135,7 +136,8 @@ static PathClauseUsage *classify_index_clause_usage(Path *path,
 static Relids get_bitmap_tree_required_outer(Path *bitmapqual);
 static void find_indexpath_quals(Path *bitmapqual, List **quals, List **preds);
 static int	find_list_position(Node *node, List **nodelist);
-static bool check_index_only(RelOptInfo *rel, IndexOptInfo *index);
+static bool check_index_only(PlannerInfo *root, RelOptInfo *rel,
+				  IndexOptInfo *index, List *index_clauses);
 static double get_loop_count(PlannerInfo *root, Relids outer_relids);
 static void match_restriction_clauses_to_index(RelOptInfo *rel,
 								   IndexOptInfo *index,
@@ -980,7 +982,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * index data retrieval anyway.
 	 */
 	index_only_scan = (scantype != ST_BITMAPSCAN &&
-					   check_index_only(rel, index));
+					   check_index_only(root, rel, index, index_clauses));
 
 	/*
 	 * 4. Generate an indexscan path if there are relevant restriction clauses
@@ -1741,7 +1743,8 @@ find_list_position(Node *node, List **nodelist)
  *		Determine whether an index-only scan is possible for this index.
  */
 static bool
-check_index_only(RelOptInfo *rel, IndexOptInfo *index)
+check_index_only(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *index,
+				 List *index_clauses)
 {
 	bool		result;
 	Bitmapset  *attrs_used = NULL;
@@ -1758,14 +1761,6 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 	/*
 	 * Check that all needed attributes of the relation are available from the
 	 * index.
-	 *
-	 * XXX this is overly conservative for partial indexes, since we will
-	 * consider attributes involved in the index predicate as required even
-	 * though the predicate won't need to be checked at runtime.  (The same is
-	 * true for attributes used only in index quals, if we are certain that
-	 * the index is not lossy.)  However, it would be quite expensive to
-	 * determine that accurately at this point, so for now we take the easy
-	 * way out.
 	 */
 
 	/*
@@ -1775,10 +1770,35 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 	 */
 	pull_varattnos((Node *) rel->reltargetlist, rel->relid, &attrs_used);
 
-	/* Add all the attributes used by restriction clauses. */
+	/*
+	 * Add all the attributes required by restriction clauses.	This is
+	 * essentially the same thing we do in create_indexscan_plan.
+	 */
 	foreach(lc, rel->baserestrictinfo)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		Assert(IsA(rinfo, RestrictInfo));
+		if (rinfo->pseudoconstant)
+			continue;			/* we may drop pseudoconstants here */
+		if (list_member_ptr(index_clauses, rinfo))
+			continue;			/* simple duplicate */
+		if (is_redundant_derived_clause(rinfo, index_clauses))
+			continue;			/* derived from same EquivalenceClass */
+		if (!contain_mutable_functions((Node *) rinfo->clause))
+		{
+			List	   *clausel = list_make1(rinfo->clause);
+
+			if (predicate_implied_by(clausel, index_clauses))
+				continue;		/* provably implied by index_clauses */
+			if (index->indpred != NIL)
+			{
+				if (rel->relid != root->parse->resultRelation &&
+					get_parse_rowmark(root->parse, rel->relid) == NULL)
+					if (predicate_implied_by(clausel, index->indpred))
+						continue;		/* implied by index predicate */
+			}
+		}
 
 		pull_varattnos((Node *) rinfo->clause, rel->relid, &attrs_used);
 	}

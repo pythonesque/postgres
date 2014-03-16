@@ -1215,7 +1215,7 @@ create_indexscan_plan(PlannerInfo *root,
 
 			if (predicate_implied_by(clausel, indexquals))
 				continue;		/* provably implied by indexquals */
-			if (best_path->indexinfo->indpred)
+			if (best_path->indexinfo->indpred != NIL)
 			{
 				if (baserelid != root->parse->resultRelation &&
 					get_parse_rowmark(root->parse, baserelid) == NULL)
